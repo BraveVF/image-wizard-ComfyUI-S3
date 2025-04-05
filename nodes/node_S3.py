@@ -1,14 +1,37 @@
 import io
+import os
+
 import torch
 import numpy as np
 import boto3
 from PIL import Image, ImageSequence, ImageOps
 
-def awss3_save_file(client, bucket, key, buff):
+from nodes.logger import logger
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def get_content_type(filename):
+    content_type_mapping = {
+        ".png": "image/png",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+    }
+    _, file_extension = os.path.splitext(filename)
+    return content_type_mapping.get(file_extension.lower(), "binary/octet-stream")
+
+
+def awss3_save_file(client, bucket, key, buff, acl="public-read"):
     client.put_object(
-            Body = buff,
-            Key = key, 
-            Bucket = bucket)
+        Bucket=bucket,
+        Key=key,
+        Body=buff,
+        ACL=acl,
+        ContentType=get_content_type(key),
+    )
+
 
 def awss3_load_file(client, bucket, key):
     outfile = io.BytesIO()
@@ -16,77 +39,111 @@ def awss3_load_file(client, bucket, key):
     outfile.seek(0)
     return outfile
 
-def awss3_init_client(region="us-east-1", ak=None, sk=None, session=None):
-    client = None
-    if (ak == None and sk == None) and session == None:
-        client = boto3.client('s3', region_name=region)
-    elif (ak != None and sk != None) and session == None:
-        client = boto3.client('s3', region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk)
-    elif (ak != None and sk != None) and session != None:
-        client = boto3.client('s3', region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk, aws_session_token=session)
-    else:
-        client = boto3.client('s3')
-    return client
+
+def awss3_init_client():
+    ak = os.getenv("AWS_ACCESS_KEY_ID", None)
+    sk = os.getenv("AWS_SECRET_ACCESS_KEY", None)
+    region_name = os.getenv("AWS_REGION_NAME", None)
+
+    if not all([ak, sk, region_name]):
+        err = "Missing required S3 environment variables."
+        logger.error(err)
+    return boto3.client('s3', region_name=region_name, aws_access_key_id=ak, aws_secret_access_key=sk)
+
+
+class ConvertPngToWebp:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image": ("IMAGE",),
+                             "resizing_width": ("INT", {"default": 200}),
+                             "resizing_height": ("INT", {"default": 200})
+                             }
+                }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "convert_png_to_webp"
+    CATEGORY = "iw-image-s3"
+    OUTPUT_NODE = True
+    OUTPUT_IS_LIST = (False,)
+
+    def convert_to_thumbnail_webp(self, image, resizing_width, resizing_height):
+        if isinstance(image, io.BytesIO):
+            img_byte_arr = image
+        else:
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='PNG')
+
+        image_loaded = Image.open(img_byte_arr)
+
+        # 원본 이미지의 크기
+        width, height = image_loaded.size
+        # 중앙 정사각형 크기: 가로, 세로 중 작은 값
+        square_side = min(width, height)
+
+        # 중앙 정사각형 영역 계산
+        left = (width - square_side) // 2
+        top = (height - square_side) // 2
+        right = left + square_side
+        bottom = top + square_side
+
+        # 중앙 정사각형으로 크롭
+        cropped_image = image_loaded.crop((left, top, right, bottom))
+        # 200x200 크기로 리사이즈
+        resized_image = cropped_image.resize((resizing_width, resizing_height), Image.Resampling.LANCZOS)
+        # WebP로 변환된 이미지를 담을 BytesIO 객체 생성
+        webp_image = io.BytesIO()
+        # WebP로 저장 (품질을 80으로 설정)
+        resized_image.save(webp_image, format="WEBP", quality=80)
+
+        # 파일 포인터를 처음으로 되돌림
+        webp_image.seek(0)
+
+        return (webp_image,)
 
 
 # SaveImageToS3
 class SaveImageToS3:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "images": ("IMAGE",), 
-                             "region": ("STRING", {"multiline": False, "default": "us-east-1"}),
-                             "aws_ak": ("STRING", {"multiline": False, "default": ""}),
-                             "aws_sk": ("STRING", {"multiline": False, "default": ""}),
-                             "session_token": ("STRING", {"multiline": False, "default": ""}),
+        return {"required": {"image": ("IMAGE",),
                              "s3_bucket": ("STRING", {"multiline": False, "default": "s3_bucket"}),
-                             "pathname": ("STRING", {"multiline": False, "default": "pathname for file"})
-                             },
-                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
-                }
-    RETURN_TYPES = ()
+                             "object_key": ("STRING", {"multiline": False, "default": "object_key"})
+                             }}
+
     FUNCTION = "save_image_to_s3"
-    CATEGORY = "image"
+    CATEGORY = "iw-image-s3"
     OUTPUT_NODE = True
 
-    def save_image_to_s3(self, images, region, aws_ak, aws_sk, session_token, s3_bucket, pathname, prompt=None, extra_pnginfo=None):
-        client = awss3_init_client(region, aws_ak, aws_sk, session_token)
-        results = list()
-        for (batch_number, image) in enumerate(images):
-            i = 255. * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
-            awss3_save_file(client, s3_bucket, "%s_%i.png"%(pathname, batch_number), img_byte_arr)
-            results.append({
-                "filename": "%s_%i.png"%(pathname, batch_number),
-                "subfolder": "",
-                "type": "output"
-            })
-        return { "ui": { "images": results } }
+    def save_image_to_s3(self, image, s3_bucket, object_key):
+        client = awss3_init_client()
+        i = 255. * image.cpu().numpy()
+        img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        awss3_save_file(client, s3_bucket, object_key, img_byte_arr)
+        return {"ui": {"image": (image,)}}
+
 
 # LoadImageFromS3
 class LoadImageFromS3:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"region": ("STRING", {"multiline": False, "default": "us-east-1"}),
-                             "aws_ak": ("STRING", {"multiline": False, "default": ""}),
-                             "aws_sk": ("STRING", {"multiline": False, "default": ""}),
-                             "session_token": ("STRING", {"multiline": False, "default": ""}),
-                             "s3_bucket": ("STRING", {"multiline": False, "default": "s3_bucket"}),
-                             "pathname": ("STRING", {"multiline": False, "default": "pathname for file"})
-                             } 
-                }
+        return {"required": {
+            "s3_bucket": ("STRING", {"multiline": False, "default": "s3_bucket"}),
+            "pathname": ("STRING", {"multiline": False, "default": "pathname for file"})
+        }}
 
     RETURN_TYPES = ("IMAGE",)
-    OUTPUT_IS_LIST = (False, )
+    OUTPUT_IS_LIST = (False,)
     FUNCTION = "load_image_from_s3"
-    CATEGORY = "image"
+    CATEGORY = "iw-image-s3"
 
-    def load_image_from_s3(self, region, aws_ak, aws_sk, session_token, s3_bucket, pathname):
-        client = awss3_init_client(region, aws_ak, aws_sk, session_token)
-        img = Image.open(awss3_load_file(client, s3_bucket, pathname))
+    def load_image_from_s3(self, s3_bucket, object_key):
+        client = awss3_init_client()
+        img = Image.open(awss3_load_file(client, s3_bucket, object_key))
         output_images = []
-        output_masks = []
         for i in ImageSequence.Iterator(img):
             i = ImageOps.exif_transpose(i)
             if i.mode == 'I':
@@ -94,23 +151,27 @@ class LoadImageFromS3:
             image = i.convert("RGB")
             image = np.array(image).astype(np.float32) / 255.0
             image = torch.from_numpy(image)[None,]
-            if 'A' in i.getbands():
-                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
-                mask = 1. - torch.from_numpy(mask)
-            else:
-                mask = torch.zeros((64,64), dtype=torch.float32, device="cpu")
             output_images.append(image)
-            output_masks.append(mask.unsqueeze(0))
 
         if len(output_images) > 1:
             output_image = torch.cat(output_images, dim=0)
-            output_mask = torch.cat(output_masks, dim=0)
         else:
             output_image = output_images[0]
-            output_mask = output_masks[0]
 
-        return (output_image, output_mask)
+        return (output_image,)
 
-# if __name__ == '__main__':
-#     client = awss3_init_client()
-#     awss3_save_file(client, "test-bucket", "test.jpg", awss3_load_file(client, "test-bucket", "test"))
+
+if __name__ == '__main__':
+    # 250405 aws 관련 테스트 성공
+    # client = awss3_init_client()
+    # awss3_save_file(client, "image-wizard-dev", "generation/zlVGHyAYREhrkUoIJFYtnj2TeTM2/508/output/HAIR_CHANGE_output_1_20250319154227_436091d5-560b-496e-9c22-ded81c160b60.png",
+    #                 awss3_load_file(client, "image-wizard-dev", "generation/zlVGHyAYREhrkUoIJFYtnj2TeTM2/508/input/ORIGINAL_20250304132406_ec1ba610-de42-4ed4-af7f-f39713ef55d3.png"))
+
+    # 250405 webp 관련 테스트 성공
+    client = awss3_init_client()
+    webp_converter = ConvertPngToWebp()
+    webp_result = webp_converter.convert_to_thumbnail_webp(image=awss3_load_file(client, "image-wizard-dev",
+                                                                                 "generation/zlVGHyAYREhrkUoIJFYtnj2TeTM2/508/input/ORIGINAL_20250304132406_ec1ba610-de42-4ed4-af7f-f39713ef55d3.png"),
+                                                           resizing_width=200, resizing_height=200)[0]
+
+    awss3_save_file(client, "image-wizard-dev", "generation/zlVGHyAYREhrkUoIJFYtnj2TeTM2/508/output/HAIR_CHANGE_output_1_20250319154227_436091d5-560b-496e-9c22-ded81c160b60.webp", webp_result)
